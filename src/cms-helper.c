@@ -55,6 +55,7 @@ void
 weston_cms_set_color_profile(struct weston_output *o,
 			     struct weston_color_profile *p)
 {
+	weston_log("On weston_cms_set_color_profile\n");
 #ifdef HAVE_LCMS
 	cmsFloat32Number in;
 	const cmsToneCurve **vcgt;
@@ -70,6 +71,9 @@ weston_cms_set_color_profile(struct weston_output *o,
 		weston_cms_gamma_clear(o);
 		return;
 	}
+
+	o->color_profile = p;
+	weston_log("Color profile save into output\n");
 
 	weston_log("Using ICC profile %s\n", p->filename);
 	vcgt = cmsReadTag (p->lcms_handle, cmsSigVcgtTag);
@@ -130,3 +134,35 @@ weston_cms_load_profile(const char *filename)
 #endif
 	return p;
 }
+
+#if 0
+unsigned char
+weston_cms_transform_data(struct weston_color_profile *p,
+		unsigned short data[GRID_SIZE][GRID_SIZE][GRID_SIZE][3])
+{
+#ifdef HAVE_LCMS
+	cmsHPROFILE input;
+	cmsHTRANSFORM transform;
+
+	/* FIXME: Don't assume sRGB always */
+	input = cmsCreate_sRGBProfile();
+
+	transform = cmsCreateTransform(input, TYPE_RGB_16, p->lcms_handle,
+			TYPE_RGB_16, INTENT_PERCEPTUAL, 0);
+
+	if (!transform) {
+		weston_log("Could not create color profile transform\n");
+		cmsCloseProfile(input);
+		return 1;
+	}
+
+	cmsDoTransform(transform, data, data, GRID_SIZE * GRID_SIZE * GRID_SIZE);
+
+	cmsDeleteTransform(transform);
+	cmsCloseProfile(input);
+
+	return 0;
+#endif
+	return 1;
+}
+#endif

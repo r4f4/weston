@@ -237,6 +237,10 @@ struct weston_output {
 			  uint16_t *r,
 			  uint16_t *g,
 			  uint16_t *b);
+
+	struct weston_color_profile *color_profile;
+	unsigned char needs_color_conversion : 1;
+	unsigned char needs_conversion_compiling : 1;
 };
 
 struct weston_pointer_grab;

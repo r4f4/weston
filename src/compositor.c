@@ -642,6 +642,10 @@ weston_surface_assign_output(struct weston_surface *es)
 	}
 	pixman_region32_fini(&region);
 
+	/* FIXME: test whether input != output */
+	new_output->needs_color_conversion = 1;
+	new_output->needs_conversion_compiling = 0;
+
 	es->output = new_output;
 	weston_surface_update_output_mask(es, mask);
 }

@@ -24,6 +24,7 @@
 
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+#include <GLES3/gl3.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +38,13 @@
 
 #include <EGL/eglext.h>
 #include "weston-egl-ext.h"
+#include "cms-helper.h"
+
+#ifdef HAVE_LCMS
+#include <lcms2.h>
+#endif
+
+#define GRID_SIZE 8
 
 struct gl_shader {
 	GLuint program;
@@ -45,6 +53,7 @@ struct gl_shader {
 	GLint tex_uniforms[3];
 	GLint alpha_uniform;
 	GLint color_uniform;
+	GLuint cms_uniform;
 	const char *vertex_source, *fragment_source;
 };
 
@@ -84,6 +93,7 @@ struct gl_surface_state {
 struct gl_renderer {
 	struct weston_renderer base;
 	int fragment_shader_debug;
+	int fragment_shader_color_conversion;
 	int fan_debug;
 
 	EGLDisplay egl_display;
@@ -462,6 +472,82 @@ use_shader(struct gl_renderer *gr, struct gl_shader *shader)
 	gr->current_shader = shader;
 }
 
+static unsigned char
+weston_cms_transform_data(struct weston_color_profile *p,
+		unsigned short data[GRID_SIZE][GRID_SIZE][GRID_SIZE][3])
+{
+	if (!p || !p->lcms_handle) {
+		weston_log("No current profile assigned\n");
+		return 1;
+	}
+
+#ifdef HAVE_LCMS
+	cmsHPROFILE input;
+	cmsHTRANSFORM transform;
+
+	/* FIXME: Don't assume sRGB always */
+	input = cmsCreate_sRGBProfile();
+
+	transform = cmsCreateTransform(input, TYPE_RGB_16, p->lcms_handle,
+			TYPE_RGB_16, INTENT_PERCEPTUAL, 0);
+
+	if (!transform) {
+		weston_log("Could not create color profile transform\n");
+		cmsCloseProfile(input);
+		return 1;
+	}
+
+	cmsDoTransform(transform, data, data, GRID_SIZE * GRID_SIZE * GRID_SIZE);
+	weston_log("Transform!\n");
+
+	cmsDeleteTransform(transform);
+	cmsCloseProfile(input);
+
+	return 0;
+#endif
+	return 1;
+}
+
+static void
+color_conversion_texture_create(struct gl_shader *shader,
+		struct weston_output *output)
+{
+	unsigned short *cube, r, g, b;
+	static unsigned short data[GRID_SIZE][GRID_SIZE][GRID_SIZE][3];
+
+
+	/* FIXME: don't need this if output == input profile */
+	/* Create the transform cube here. Use output profile.  */
+	cube = &data[0][0][0][0];
+	for (r = 0; r < GRID_SIZE; r++) {
+		for (g = 0; g < GRID_SIZE; g++) {
+			for (b = 0; b < GRID_SIZE; b++) {
+				*(cube++) = (r * 255) / (GRID_SIZE - 1);
+				*(cube++) = (g * 255) / (GRID_SIZE - 1);
+				*(cube++) = (b * 255) / (GRID_SIZE - 1);
+			}
+		}
+	}
+
+	/* FIXME: test error/success output */
+	if (weston_cms_transform_data(output->color_profile, data)) {
+		weston_log("Could not create texture\n");
+		return;
+	}
+
+	glGenTextures(1, &(shader->cms_uniform));
+	glBindTexture(GL_TEXTURE_3D, shader->cms_uniform);
+
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_RGB, GRID_SIZE, GRID_SIZE, GRID_SIZE,
+			0, GL_RGB, GL_UNSIGNED_SHORT, data);
+}
+
 static void
 shader_uniforms(struct gl_shader *shader,
 		       struct weston_surface *surface,
@@ -474,10 +560,18 @@ shader_uniforms(struct gl_shader *shader,
 			   1, GL_FALSE, output->matrix.d);
 	glUniform4fv(shader->color_uniform, 1, gs->color);
 	glUniform1f(shader->alpha_uniform, surface->alpha);
+	glUniform1i(shader->cms_uniform, 0);
+
+	if (output->needs_conversion_compiling) {
+		weston_log("Doing conversion compiling\n");
+		color_conversion_texture_create(shader, output);
+		output->needs_conversion_compiling = 0;
+	}
 
 	for (i = 0; i < gs->num_textures; i++)
 		glUniform1i(shader->tex_uniforms[i], i);
 }
+
 
 static void
 draw_surface(struct weston_surface *es, struct weston_output *output,
@@ -1190,9 +1284,9 @@ static const char fragment_brace[] =
 
 static const char texture_fragment_shader_rgba[] =
 	"precision mediump float;\n"
-	"varying vec2 v_texcoord;\n"
 	"uniform sampler2D tex;\n"
 	"uniform float alpha;\n"
+	"varying vec2 v_texcoord;\n"
 	"void main()\n"
 	"{\n"
 	"   gl_FragColor = alpha * texture2D(tex, v_texcoord)\n;"
@@ -1200,9 +1294,9 @@ static const char texture_fragment_shader_rgba[] =
 
 static const char texture_fragment_shader_rgbx[] =
 	"precision mediump float;\n"
-	"varying vec2 v_texcoord;\n"
 	"uniform sampler2D tex;\n"
 	"uniform float alpha;\n"
+	"varying vec2 v_texcoord;\n"
 	"void main()\n"
 	"{\n"
 	"   gl_FragColor.rgb = alpha * texture2D(tex, v_texcoord).rgb\n;"
@@ -1212,9 +1306,9 @@ static const char texture_fragment_shader_rgbx[] =
 static const char texture_fragment_shader_egl_external[] =
 	"#extension GL_OES_EGL_image_external : require\n"
 	"precision mediump float;\n"
-	"varying vec2 v_texcoord;\n"
 	"uniform samplerExternalOES tex;\n"
 	"uniform float alpha;\n"
+	"varying vec2 v_texcoord;\n"
 	"void main()\n"
 	"{\n"
 	"   gl_FragColor = alpha * texture2D(tex, v_texcoord)\n;"
@@ -1224,8 +1318,8 @@ static const char texture_fragment_shader_y_uv[] =
 	"precision mediump float;\n"
 	"uniform sampler2D tex;\n"
 	"uniform sampler2D tex1;\n"
-	"varying vec2 v_texcoord;\n"
 	"uniform float alpha;\n"
+	"varying vec2 v_texcoord;\n"
 	"void main() {\n"
 	"  float y = 1.16438356 * (texture2D(tex, v_texcoord).x - 0.0625);\n"
 	"  float u = texture2D(tex1, v_texcoord).r - 0.5;\n"
@@ -1238,8 +1332,8 @@ static const char texture_fragment_shader_y_u_v[] =
 	"uniform sampler2D tex;\n"
 	"uniform sampler2D tex1;\n"
 	"uniform sampler2D tex2;\n"
-	"varying vec2 v_texcoord;\n"
 	"uniform float alpha;\n"
+	"varying vec2 v_texcoord;\n"
 	"void main() {\n"
 	"  float y = 1.16438356 * (texture2D(tex, v_texcoord).x - 0.0625);\n"
 	"  float u = texture2D(tex1, v_texcoord).x - 0.5;\n"
@@ -1251,8 +1345,8 @@ static const char texture_fragment_shader_y_xuxv[] =
 	"precision mediump float;\n"
 	"uniform sampler2D tex;\n"
 	"uniform sampler2D tex1;\n"
-	"varying vec2 v_texcoord;\n"
 	"uniform float alpha;\n"
+	"varying vec2 v_texcoord;\n"
 	"void main() {\n"
 	"  float y = 1.16438356 * (texture2D(tex, v_texcoord).x - 0.0625);\n"
 	"  float u = texture2D(tex1, v_texcoord).g - 0.5;\n"
@@ -1264,9 +1358,19 @@ static const char solid_fragment_shader[] =
 	"precision mediump float;\n"
 	"uniform vec4 color;\n"
 	"uniform float alpha;\n"
+	"varying vec2 v_texcoord;\n"
 	"void main()\n"
 	"{\n"
 	"   gl_FragColor = alpha * color\n;"
+	;
+
+static const char fragment_shader_color_uniforms[] =
+	"uniform sampler2D cms_lut;\n"
+	;
+
+static const char texture_fragment_shader_color[] =
+	"	vec3 color = texture2D(cms_lut, v_texcoord).rgb;\n"
+	"	gl_FragColor.rgb = color;\n"
 	;
 
 static int
@@ -1295,25 +1399,25 @@ shader_init(struct gl_shader *shader, struct gl_renderer *renderer,
 {
 	char msg[512];
 	GLint status;
-	int count;
-	const char *sources[3];
+	int i = 0;
+	const char *sources[4];
 
 	shader->vertex_shader =
 		compile_shader(GL_VERTEX_SHADER, 1, &vertex_source);
 
-	if (renderer->fragment_shader_debug) {
-		sources[0] = fragment_source;
-		sources[1] = fragment_debug;
-		sources[2] = fragment_brace;
-		count = 3;
-	} else {
-		sources[0] = fragment_source;
-		sources[1] = fragment_brace;
-		count = 2;
+	if (renderer->fragment_shader_color_conversion) {
+		sources[i++] = fragment_shader_color_uniforms;
 	}
+	sources[i++] = fragment_source;
+	if (renderer->fragment_shader_debug)
+		sources[i++] = fragment_debug;
+	if (renderer->fragment_shader_color_conversion) {
+		sources[i++] = texture_fragment_shader_color;
+	}
+	sources[i++] = fragment_brace;
 
 	shader->fragment_shader =
-		compile_shader(GL_FRAGMENT_SHADER, count, sources);
+		compile_shader(GL_FRAGMENT_SHADER, i, sources);
 
 	shader->program = glCreateProgram();
 	glAttachShader(shader->program, shader->vertex_shader);
@@ -1335,6 +1439,7 @@ shader_init(struct gl_shader *shader, struct gl_renderer *renderer,
 	shader->tex_uniforms[2] = glGetUniformLocation(shader->program, "tex2");
 	shader->alpha_uniform = glGetUniformLocation(shader->program, "alpha");
 	shader->color_uniform = glGetUniformLocation(shader->program, "color");
+	shader->cms_uniform = glGetUniformLocation(shader->program, "cms_lut");
 
 	return 0;
 }
@@ -1738,6 +1843,38 @@ fragment_debug_binding(struct weston_seat *seat, uint32_t time, uint32_t key,
 }
 
 static void
+fragment_debug_color_binding(struct weston_seat *seat, uint32_t time,
+		uint32_t key, void *data)
+{
+	struct weston_compositor *ec = data;
+	struct gl_renderer *gr = get_renderer(ec);
+	struct weston_output *output;
+
+	gr->fragment_shader_color_conversion ^= 1;
+	weston_log("Color conversion: %d\n", gr->fragment_shader_color_conversion);
+
+	shader_release(&gr->texture_shader_rgba);
+	shader_release(&gr->texture_shader_rgbx);
+	shader_release(&gr->texture_shader_egl_external);
+	shader_release(&gr->texture_shader_y_uv);
+	shader_release(&gr->texture_shader_y_u_v);
+	shader_release(&gr->texture_shader_y_xuxv);
+	shader_release(&gr->solid_shader);
+
+	/* Force use_shader() to call glUseProgram(), since we need to use
+	 * the recompiled version of the shader. */
+	gr->current_shader = NULL;
+
+	wl_list_for_each(output, &ec->output_list, link) {
+		weston_output_damage(output);
+		if (output->needs_color_conversion) {
+			output->needs_conversion_compiling =
+				gr->fragment_shader_color_conversion;
+		}
+	}
+}
+
+static void
 fan_debug_repaint_binding(struct weston_seat *seat, uint32_t time, uint32_t key,
 		      void *data)
 {
@@ -1849,6 +1986,8 @@ gl_renderer_setup(struct weston_compositor *ec, EGLSurface egl_surface)
 
 	weston_compositor_add_debug_binding(ec, KEY_S,
 					    fragment_debug_binding, ec);
+	weston_compositor_add_debug_binding(ec, KEY_C,
+					    fragment_debug_color_binding, ec);
 	weston_compositor_add_debug_binding(ec, KEY_F,
 					    fan_debug_repaint_binding, ec);
 

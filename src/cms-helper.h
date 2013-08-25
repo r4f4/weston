@@ -27,6 +27,8 @@
 
 #include "compositor.h"
 
+//#define GRID_SIZE 16
+
 /* General overview on how to be a CMS plugin:
  *
  * First, some nomenclature:
@@ -68,5 +70,9 @@ struct weston_color_profile *
 weston_cms_load_profile(const char *filename);
 void
 weston_cms_destroy_profile(struct weston_color_profile *p);
+/* unsigned char
+weston_cms_transform_data(struct weston_color_profile *p,
+		unsigned short data[GRID_SIZE][GRID_SIZE][GRID_SIZE][3]);
+*/
 
 #endif
